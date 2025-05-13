@@ -7,7 +7,6 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]  # Takes the second half of the last dimension
     return torch.cat((-x2, x1), dim=-1)
 
-
 def apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)  # Add the head dimension
     sin = sin.unsqueeze(unsqueeze_dim)  # Add the head dimension

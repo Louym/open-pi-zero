@@ -27,7 +27,7 @@ for TASK_CONFIG in "${TASK_CONFIGS[@]}" ; do
     TASK="${TASK_CONFIG%%:*}"
     CONFIG_NAME="${TASK_CONFIG##*:}"
 
-    CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 uv run \
+    CUDA_VISIBLE_DEVICES=1 HYDRA_FULL_ERROR=1 python \
         scripts/run.py \
         --config-name=$CONFIG_NAME \
         --config-path=../config/eval \
@@ -36,8 +36,7 @@ for TASK_CONFIG in "${TASK_CONFIGS[@]}" ; do
         env.task=$TASK \
         horizon_steps=4 \
         act_steps=2 \
-        use_bf16=False \
-        use_torch_compile=True \
+        use_bf16=True \
         name=fractal_beta \
-        'checkpoint_path="...fractal_beta.pt"'
+        'checkpoint_path="/home/yuming/workspace/models/open-pi-zero/fractal_beta_step29576_2024-12-29_13-10_42.pt"'
 done

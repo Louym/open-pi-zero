@@ -36,11 +36,10 @@ class GemmaRotaryEmbedding(nn.Module):
         self.base = (
             base  # should be tuned based on the max_seq_len, e.g., in action expert
         )
-
         # Calculate the theta according to the formula theta_i = base^(2i/dim) where i = 0, 1, 2, ..., dim // 2
         inv_freq = 1.0 / (
             self.base
-            ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim)
+            ** (torch.arange(0, self.dim, 2, dtype=torch.int64).half() / self.dim)
         )
         self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
 

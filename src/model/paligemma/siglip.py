@@ -94,7 +94,6 @@ class SiglipAttention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim**-0.5  # Equivalent to 1 / sqrt(self.head_dim)
         self.dropout = config.attention_dropout
-
         layer = get_layer(
             use_quantize,
             use_lora,
@@ -220,21 +219,27 @@ class SiglipEncoderLayer(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # residual: [Batch_Size, Num_Patches, Embed_Dim]
         residual = hidden_states
+        # torch.save(residual,"input.pt")
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = self.layer_norm1(hidden_states)
+        # torch.save(hidden_states,"afternorm.pt")
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states, _ = self.self_attn(hidden_states=hidden_states)
+        # torch.save(hidden_states,"afterattn.pt")
         # [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = residual + hidden_states
         # residual: [Batch_Size, Num_Patches, Embed_Dim]
         residual = hidden_states
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = self.layer_norm2(hidden_states)
+        # torch.save(hidden_states,"afternorm2.pt")
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = self.mlp(hidden_states)
+        # torch.save(hidden_states,"aftermlp.pt")
         # [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = residual + hidden_states
-
+        # torch.save(hidden_states,"output.pt")
+        # exit()
         return hidden_states
 
 
@@ -292,9 +297,9 @@ class SiglipVisionTransformer(nn.Module):
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # pixel_values: [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = self.embeddings(pixel_values)
-
         last_hidden_state = self.encoder(inputs_embeds=hidden_states)
-
+        if isinstance(last_hidden_state, tuple):
+            last_hidden_state=last_hidden_state[0]
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
         return last_hidden_state

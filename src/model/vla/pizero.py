@@ -21,7 +21,7 @@ from src.model.vla.modules import (
 )
 from src.utils.decorator import NoSyncBase
 from src.utils.monitor import log_execution_time
-
+import time
 log = logging.getLogger(__name__)
 
 
@@ -342,7 +342,7 @@ class PiZero(nn.Module, NoSyncBase):
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
         dtype, device = attention_mask.dtype, attention_mask.device
-
+        bsz=1
         if kv_cache is None or kv_cache.num_items() == 0:
             # do not mask any token, because we're in the prefill phase
             # assume no padding
@@ -390,7 +390,9 @@ class PiZero(nn.Module, NoSyncBase):
         image_features = self.multi_modal_projector(selected_image_feature)
 
         # normalize the image features
-        _, _, embed_dim = image_features.shape
+        if len(image_features.shape)==2:
+            image_features=image_features.reshape(1,*image_features.shape)
+        embed_dim = image_features.shape[-1]
         bsz, seq_len = input_ids.shape
         scaled_image_features = image_features / (self.image_text_hidden_size**0.5)
 
@@ -423,6 +425,7 @@ class PiZero(nn.Module, NoSyncBase):
         proprio_position_ids: torch.LongTensor,
         action_position_ids: torch.LongTensor,
         proprios: torch.FloatTensor,
+        quant_action=False,
     ) -> torch.FloatTensor:
         dtype, device = pixel_values.dtype, pixel_values.device
         bsz = pixel_values.size(0)
@@ -434,7 +437,6 @@ class PiZero(nn.Module, NoSyncBase):
 
         # proprio
         proprio_embeds = self.proprio_encoder(proprios)
-
         # forward pass thru the vlm and proprio, cache the kv
         _, kv_caches = self.joint_model(
             attention_mask=image_text_proprio_mask,
@@ -449,7 +451,6 @@ class PiZero(nn.Module, NoSyncBase):
             kv_caches=kv_caches,
             return_caches=True,
         )
-
         # sample pure action noise
         action = torch.randn(
             (bsz, self.horizon_steps, self.action_dim), device=device, dtype=dtype
@@ -471,9 +472,10 @@ class PiZero(nn.Module, NoSyncBase):
                 attention_mask=action_mask,
                 position_ids_all={"action": action_position_ids},
                 embeds_all={"action": action_embeds},
-                time_cond=time_cond,
+                time_cond=None,
                 kv_caches=kv_caches,
                 cache_mode="append_non_active",  # use caches from other mixtures, i.e., vlm and proprio
+                quant_action=quant_action,
             )["action"]
             # decode action: [Batch_Size, Horizon_Steps, Action_Dim]
             action_vel = self.action_decoder(action_embeds)
@@ -555,7 +557,132 @@ class PiZero(nn.Module, NoSyncBase):
                 self.final_action_clip_value,
             )
         return action
+    def benchmark_action(
+        self,
+        input_ids: torch.LongTensor,
+        pixel_values: torch.FloatTensor,
+        image_text_proprio_mask: torch.FloatTensor,
+        action_mask: torch.FloatTensor,
+        vlm_position_ids: torch.LongTensor,
+        proprio_position_ids: torch.LongTensor,
+        action_position_ids: torch.LongTensor,
+        proprios: torch.FloatTensor,
+        run_times=20,
+        quant_action=False,
+    ) -> torch.FloatTensor:
+        dtype, device = pixel_values.dtype, pixel_values.device
+        bsz = pixel_values.size(0)
+        print(f"Using {bsz} images to run ({pixel_values.shape}).")
+        kv_caches = self.joint_model.build_mixture_caches()
 
+        # merge the text tokens and the image tokens
+        time_list=[]
+        for _ in range(run_times):
+            torch.cuda.synchronize()
+            t1=time.time()
+            inputs_embeds = self._forward_siglip_and_text_embedding(input_ids, pixel_values)
+            torch.cuda.synchronize()
+            t2=time.time()
+            time_list.append(t2-t1)
+        siglip_t=sum(time_list[2:])/len(time_list[2:])
+        # proprio
+        time_list=[]
+        for _ in range(run_times):
+            torch.cuda.synchronize()
+            t1=time.time()
+            proprio_embeds = self.proprio_encoder(proprios)
+            torch.cuda.synchronize()
+            t2=time.time()
+            time_list.append(t2-t1)
+        proprioencoder_t=sum(time_list[2:])/len(time_list[2:])
+        
+        # forward pass thru the vlm and proprio, cache the kv
+        time_list=[]
+        for _ in range(run_times):
+            torch.cuda.synchronize()
+            t1=time.time()
+            _, _ = self.joint_model(
+                attention_mask=image_text_proprio_mask,
+                position_ids_all={
+                    "vlm": vlm_position_ids,
+                    "proprio": proprio_position_ids,
+                },
+                embeds_all={
+                    "vlm": inputs_embeds,
+                    "proprio": proprio_embeds,
+                },
+                kv_caches=kv_caches,
+                return_caches=True,
+            )
+            torch.cuda.synchronize()
+            t2=time.time()
+            time_list.append(t2-t1)
+        vlmpropri_t=sum(time_list[2:])/len(time_list[2:])
+        _, kv_caches = self.joint_model(
+                attention_mask=image_text_proprio_mask,
+                position_ids_all={
+                    "vlm": vlm_position_ids,
+                    "proprio": proprio_position_ids,
+                },
+                embeds_all={
+                    "vlm": inputs_embeds,
+                    "proprio": proprio_embeds,
+                },
+                kv_caches=kv_caches,
+                return_caches=True,
+            )
+        # sample pure action noise
+        time_list=[]
+        print(f"Run action for {self.num_inference_steps} times")
+        for _ in range(run_times):
+            torch.cuda.synchronize()
+            t1=time.time()
+            action = torch.randn(
+                (bsz, self.horizon_steps, self.action_dim), device=device, dtype=dtype
+            )
+
+            # forward euler integration --- using kv caches of vlm and proprio
+            delta_t = 1.0 / self.num_inference_steps
+            t = torch.zeros(bsz, device=device, dtype=dtype)
+            for _ in range(self.num_inference_steps):
+                # encode action and time into embedding
+                time_cond = self.time_embedding(t)
+                # [Batch_Size, Horizon_Steps, Embed_Dim]
+                if self.action_expert_adaptive_mode:
+                    action_embeds = self.action_encoder(action)
+                else:
+                    action_embeds = self.action_encoder(action, time_cond)
+                # [Batch_Size, Horizon_Steps, Embed_Dim]
+                action_embeds = self.joint_model(
+                    attention_mask=action_mask,
+                    position_ids_all={"action": action_position_ids},
+                    embeds_all={"action": action_embeds},
+                    time_cond=time_cond,
+                    kv_caches=kv_caches,
+                    cache_mode="append_non_active",  # use caches from other mixtures, i.e., vlm and proprio,
+                    quant_action=quant_action
+                )["action"]
+                # decode action: [Batch_Size, Horizon_Steps, Action_Dim]
+                action_vel = self.action_decoder(action_embeds)
+                action += delta_t * action_vel
+                t += delta_t
+            torch.cuda.synchronize()
+            t2=time.time()
+            time_list.append(t2-t1)
+        act10_t=sum(time_list[2:])/len(time_list[2:])
+        
+        
+
+        # clamp final output if specified
+        if self.final_action_clip_value is not None:
+            action = torch.clamp(
+                action,
+                -self.final_action_clip_value,
+                self.final_action_clip_value,
+            )
+        times={"siglip_t":siglip_t,"proprioencoder_t":proprioencoder_t,"vlmpropri_t":vlmpropri_t,"act10_t":act10_t}
+        print(times)
+        return action
     def infer_text(
         self,
         input_ids: torch.LongTensor,
@@ -672,6 +799,7 @@ class PiZeroInference(PiZero):
         proprio_position_ids: torch.LongTensor,
         action_position_ids: torch.LongTensor,
         proprios: torch.FloatTensor,
+        quant_action
     ) -> torch.FloatTensor:
         return super().infer_action(
             input_ids,
@@ -682,6 +810,7 @@ class PiZeroInference(PiZero):
             proprio_position_ids,
             action_position_ids,
             proprios,
+            quant_action=quant_action
         )
 
 
@@ -708,7 +837,7 @@ if __name__ == "__main__":
 
     torch.manual_seed(args.seed)
 
-    config = OmegaConf.load("config/train/bridge.yaml")
+    config = OmegaConf.load("/home/yuming/workspace/pi/open-pi-zero/config/train/bridge.yaml")
     if args.text_only:
         config.use_lm_head = True
         config.mixture.vlm.use_final_norm = True
@@ -717,18 +846,17 @@ if __name__ == "__main__":
     model.tie_action_proprio_weights()
     if args.load_pretrained_weights:
         model.load_pretrained_weights()
-    dtype = torch.bfloat16 if args.use_bf16 else torch.float32
+    dtype = torch.bfloat16 if args.use_bf16 else torch.half
     model.to(device)
     model.to(dtype)
     model.eval()
     print(f"Using {device} and {dtype}...")
-
     # dummy image --- replace the first image with a real one
     bsz = 1 if args.text_only else 2
     dummy_images = torch.randint(
         0, 256, (bsz, 3, 224, 224), dtype=torch.uint8
     )  # not used if text_only
-    real_image_path = "media/maniskill_pp.png"
+    real_image_path = "/home/yuming/workspace/pi/open-pi-zero/media/vila-logo.jpg"
     real_image = Image.open(real_image_path).convert("RGB")
     real_image_t = torch.as_tensor(
         np.array(real_image.resize((224, 224))).transpose(2, 0, 1)
@@ -737,7 +865,7 @@ if __name__ == "__main__":
 
     # text and proprio
     dummy_texts = [
-        "this image shows ",
+        "Describe the image in great detail",
         "this is a nice portrait of London because ",
     ][:bsz]
     dummy_proprio = torch.rand(bsz, config.cond_steps, config.action_dim)
@@ -757,12 +885,15 @@ if __name__ == "__main__":
     input_ids = model_inputs["input_ids"]
     attention_mask = model_inputs["attention_mask"]
     pixel_values = model_inputs["pixel_values"].to(dtype)
-
+    warmup_m=torch.rand((8192,8192),dtype=torch.half,device="cuda:0")
+    for _ in range(50):
+        warmup_m=warmup_m@warmup_m
     # inference
+    torch.cuda.synchronize()
     start_time = time.time()
     if args.text_only:  # no sampling
         kv_cache = model.build_text_cache()
-        num_tokens_to_generate = 20
+        num_tokens_to_generate = 200
         print(f"Generating text of maximum {num_tokens_to_generate} tokens...")
 
         stop_token = processor.tokenizer.eos_token_id
@@ -781,8 +912,8 @@ if __name__ == "__main__":
             next_token = next_token.squeeze(0)  # remove batch dimension
             generated_tokens.append(next_token)
             # stop if the stop token has been generated
-            if next_token.item() == stop_token:
-                break
+            # if next_token.item() == stop_token:
+            #     break
             # only input the new token the next time since using cache
             input_ids = next_token.unsqueeze(-1)
             attention_mask = torch.cat(
@@ -838,5 +969,6 @@ if __name__ == "__main__":
         print("\n\n=========================")
         print("Final action dimensions:", actions.shape)
         print("Final action values:", actions)
+    torch.cuda.synchronize()
     print("Time taken:", time.time() - start_time)
     print("============================\n\n")

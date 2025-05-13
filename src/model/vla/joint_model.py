@@ -9,7 +9,7 @@ KV caches --- There are a few different modes depending on the setting:
     - action inference, no cache during vlm and proprio forward, then use vlm and proprio cache --- append, non-active (mode="append_non_active")
     - action flow matching training, all active, no cache (mode does not matter)
 """
-
+from flash_attn import flash_attn_func
 import math
 from typing import Optional, Tuple
 
@@ -148,7 +148,6 @@ def forward_mixture_attn(
     bsz = len(attention_mask)
     q_lens = [hidden_states.size(1) for hidden_states in hidden_states_all.values()]
     active_mixture_names = list(hidden_states_all.keys())
-
     # always re-compute queries
     query_states_all = {}
     for name in active_mixture_names:
@@ -163,7 +162,7 @@ def forward_mixture_attn(
     value_states_all = {}
     if cache_mode == "append_non_active":
         for name, kv_cache in kv_caches.items():
-            if name not in active_mixture_names:
+            if name not in active_mixture_names:#False
                 key_states_all[name], value_states_all[name] = kv_cache.get(layer_idx)
 
     # the caching logic below can be much simplified if we ignore the "no_append" mode, which is only used in the naive action inference mode
@@ -176,7 +175,7 @@ def forward_mixture_attn(
 
         # always use kv cache if it has the current layer
         flag_cached_mixture = name in kv_caches and kv_caches[name].has_item(layer_idx)
-        if flag_cached_mixture:
+        if flag_cached_mixture:#False #True
             key_states_cached, value_states_cached = kv_caches[name].get(
                 layer_idx
             )  # note: rope already applied before they were cached
@@ -184,15 +183,15 @@ def forward_mixture_attn(
         # always add to cache in append mode, or kv cache does not have the layer yet (in no_append mode)
         flag_to_cache_mixture = (
             name in kv_caches and not kv_caches[name].has_item(layer_idx)
-        ) or cache_mode == "append"
-
+        ) or cache_mode == "append" #True #False #False
+        
         # calculate kv for new tokens if in append mode or this layer is not cached
         key_states_new, value_states_new = None, None
-        flag_calc_new_kv = not flag_cached_mixture or cache_mode == "append"
+        flag_calc_new_kv = not flag_cached_mixture or cache_mode == "append" #True #False
         assert flag_cached_mixture or flag_calc_new_kv, (
             "Cannot skip new kv calculation while also not using cache!"
         )
-        if flag_calc_new_kv:
+        if flag_calc_new_kv: # True #False #True
             hidden_states = hidden_states_all[name]
             # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
             key_states_new = mixtures[name].attn_func(
@@ -211,7 +210,7 @@ def forward_mixture_attn(
                 rope_sin,
             )
 
-            if flag_to_cache_mixture:
+            if flag_to_cache_mixture:#True #False #False
                 kv_caches[name].update(
                     key_states_new,
                     value_states_new,
@@ -226,7 +225,7 @@ def forward_mixture_attn(
         query_states_all[name] = query_states
 
         # assign K and V carefully for this active mixture
-        if flag_cached_mixture:
+        if flag_cached_mixture: #False #True #False
             key_states = key_states_cached
             value_states = value_states_cached
             if key_states_new is not None:
@@ -255,13 +254,13 @@ def forward_mixture_attn(
     query_states = torch.cat(tuple(query_states_all.values()), dim=-2)
     key_states = torch.cat(tuple(key_states_all.values()), dim=-2)
     value_states = torch.cat(tuple(value_states_all.values()), dim=2)
-
+    
     # Perform the calculation as usual, Q * K^T / sqrt(head_dim)
     # [Batch_Size, Num_Heads_Q, Full_Seq_Len, Full_Seq_Len]
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
         mixtures[active_mixture_names[0]].head_dim
     )
-
+    
     # Soft capping
     attn_weights = attn_weights / attn_softclamp
     attn_weights = torch.tanh(attn_weights)
@@ -284,7 +283,7 @@ def forward_mixture_attn(
     # Make sure the sequence length is the second dimension. # [Batch_Size, Num_Heads_Q, Full_Seq_Len, Head_Dim] -> [Batch_Size, Full_Seq_Len, Num_Heads_Q, Head_Dim]
     attn_output = attn_output.transpose(1, 2).contiguous()
     # Concatenate all the heads together. [Batch_Size, Full_Seq_Len, Num_Heads_Q, Head_Dim] -> [Batch_Size, Full_Seq_Len, Num_Heads_Q * Head_Dim]
-    attn_output = attn_output.view(bsz, sum(q_lens), -1)
+    attn_output = attn_output.reshape(bsz, sum(q_lens), -1)
 
     # Split into the different mixtures
     attn_outputs = torch.split(attn_output, q_lens, dim=1)
@@ -335,6 +334,7 @@ class JointModel(nn.Module):
         kv_caches: dict[KVCache] = {},
         cache_mode: str = "append_non_active",
         return_caches: bool = False,
+        quant_action=False,
     ) -> dict[torch.FloatTensor]:
         """
         Assume attention_mask is in the right block attention form
@@ -342,7 +342,7 @@ class JointModel(nn.Module):
         embeds_all and position_ids_all need to be in the correct order, e.g., {"vlm": ..., "proprio": ..., "action": ...}
         """
         active_mixture_names = list(embeds_all.keys())
-
+                
         # normalization
         # [Batch_Size, Seq_Len, Hidden_Size]
         for name in active_mixture_names:
@@ -353,23 +353,34 @@ class JointModel(nn.Module):
                 device=embeds_all[name].device,
             )
             embeds_all[name] *= normalizer
-
-        # layers
-        for layer_idx in range(self.num_hidden_layers):
-            is_final_layer = layer_idx == self.num_hidden_layers - 1
-            embeds_all = forward_mixture_layers(
-                self.mixtures,
-                attention_mask,
-                position_ids_all,
-                embeds_all,
-                layer_idx=layer_idx,
-                time_cond=time_cond,
-                kv_caches=kv_caches,
-                cache_mode=cache_mode,
-                post_attn_skip_names=final_layer_post_attn_skip_names
-                if is_final_layer
-                else [],
-            )
+        if quant_action and active_mixture_names==["action"]:
+            
+                return self.mixtures.action(
+                    attention_mask,
+                    position_ids_all,
+                    embeds_all,
+                    None,#Temporiarily Dummy
+                    None,
+                    kv_caches,
+                    )
+                
+        else:
+            # layers
+            for layer_idx in range(self.num_hidden_layers):
+                is_final_layer = layer_idx == self.num_hidden_layers - 1
+                embeds_all = forward_mixture_layers(
+                    self.mixtures,
+                    attention_mask,
+                    position_ids_all,
+                    embeds_all,
+                    layer_idx=layer_idx,
+                    time_cond=time_cond,
+                    kv_caches=kv_caches,
+                    cache_mode=cache_mode,
+                    post_attn_skip_names=final_layer_post_attn_skip_names
+                    if is_final_layer
+                    else [],
+                )
 
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states_all = {}
@@ -381,7 +392,6 @@ class JointModel(nn.Module):
         if return_caches:
             return hidden_states_all, kv_caches
         return hidden_states_all
-
 
 if __name__ == "__main__":
     from omegaconf import OmegaConf

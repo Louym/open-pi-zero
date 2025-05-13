@@ -35,18 +35,43 @@ def main(args):
     # load default configs
     if "fractal" in args.checkpoint_path:
         cfg = OmegaConf.load(
-            "config/eval/fractal_apple.yaml"
+            "/home/yuming/workspace/pi/open-pi-zero/config/eval/fractal_apple.yaml"
         )  # doesn't matter which task
     if "bridge" in args.checkpoint_path:
-        cfg = OmegaConf.load("config/eval/bridge.yaml")
+        cfg = OmegaConf.load("/home/yuming/workspace/pi/open-pi-zero/config/eval/bridge.yaml")
 
     # model
-    dtype = torch.bfloat16 if args.use_bf16 else torch.float32
+    dtype = torch.bfloat16 if args.use_bf16 else torch.float16
     model = PiZeroInference(cfg, use_ddp=False)
     load_checkpoint(model, args.checkpoint_path)
     model.freeze_all_weights()
     model.to(dtype)
     model.to(device)
+    model=model.eval()
+    if args.quant_VT:
+        from tinychat.modules import QuantSiglipEncoder
+        from awq.quantize import fake_quant
+        model.vision_tower.vision_model.encoder=QuantSiglipEncoder(
+                    model.vision_tower.vision_model.encoder)
+        # fake_quant(model.vision_tower,8)
+        # fake_quant(model.joint_model.mixtures.vlm,4)
+        # fake_quant(model.joint_model.mixtures.proprio,8)
+        # fake_quant(model.joint_model.mixtures.action,4)
+    if args.quant_joint_model:
+        from awq.quantize.quantizer import (
+                pseudo_quantize_model_weight,
+                real_quantize_model_weight,
+            )
+        q_config={
+            "zero_point": True,  # by default True
+            "q_group_size": 128,  # whether to use group quantization
+        }
+        real_quantize_model_weight(model, w_bit=4, q_config=q_config, init_only=False
+        )
+        model.to(device)
+    if args.quant_action:
+        from tinychat.modules import QuantMixture
+        model.joint_model.mixtures.action=QuantMixture(model.joint_model.mixtures.action)
     if (
         args.use_torch_compile
     ):  # model being compiled in the first batch which takes some time
@@ -72,6 +97,7 @@ def main(args):
     episode_id = random.randint(0, 20)
     env_reset_options = {}
     env_reset_options["obj_init_options"] = {
+        
         "episode_id": episode_id,  # this determines the obj inits in bridge
     }
     obs, reset_info = env.reset(options=env_reset_options)
@@ -110,7 +136,7 @@ def main(args):
         inputs = {k: v.to(device) for k, v in inputs.items()}
         start_inference_time = time.time()
         with torch.inference_mode():  # speeds up
-            actions = model(**inputs)
+            actions = model(**inputs, quant_action=args.quant_action)
         if cnt_step > 0:
             inference_times.append(time.time() - start_inference_time)
         env_actions = env_adapter.postprocess(actions[0].float().cpu().numpy())
@@ -182,6 +208,9 @@ if __name__ == "__main__":
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--use_torch_compile", action="store_true")
     parser.add_argument("--recording", action="store_true")
+    parser.add_argument("--quant_joint_model", action="store_true")
+    parser.add_argument("--quant_VT", action="store_true")
+    parser.add_argument("--quant_action", action="store_true")
     args = parser.parse_args()
 
     # check task
